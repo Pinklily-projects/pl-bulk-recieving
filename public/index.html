@@ -37,18 +37,25 @@
   <!-- ============ SCAN ============ -->
   <section id="view-scan" class="view">
     <ol class="steps" aria-label="Scan steps">
-      <li data-step="po">PO</li><li data-step="sku">SKU</li><li data-step="size" class="optional" title="Only when size is a separate barcode">Size</li><li data-step="qty">Qty</li>
+      <li data-step="po">PO</li><li data-step="loc">Loc</li><li data-step="sku">SKU</li><li data-step="size" class="optional" title="Only when size is a separate barcode">Size</li><li data-step="qty">Qty</li>
     </ol>
 
     <div id="msg" class="msg" role="status" aria-live="assertive">Scan a PO number to start.</div>
 
     <div class="card">
-      <label for="in-po">PO number</label>
+      <div class="card-head"><label for="in-po">PO number</label><button id="btn-sync" class="link sync" title="Reload open POs from ShipHero"><span id="sync-status">Open POs: —</span> ↻</button></div>
       <div class="row">
-        <input id="in-po" class="scan" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="Scan or type PO">
+        <input id="in-po" class="scan" list="open-pos" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="Scan or type PO">
+        <datalist id="open-pos"></datalist>
         <button id="btn-po" class="btn fx-press">Load</button>
       </div>
       <div id="po-card" class="po-card" hidden></div>
+    </div>
+
+    <div class="card">
+      <label for="in-loc">Location <span class="hint">(where this PO is going — scan once)</span></label>
+      <input id="in-loc" class="scan" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="Scan location barcode" disabled>
+      <div id="loc-card" class="loc-card" hidden></div>
     </div>
 
     <div class="card">
@@ -98,7 +105,7 @@
 <dialog id="dlg-upload" class="dlg">
   <h2>Upload to ShipHero?</h2>
   <div id="upload-summary"></div>
-  <p class="hint">This adds the scanned quantities to <b>Quantity received</b> on each PO line. It does not add inventory.</p>
+  <p class="hint">For each line this <b>adds the units to the scanned location</b> (logged in ShipHero's inventory history with the PO number and your initials), then adds them to <b>Quantity received</b> on the PO.</p>
   <div class="dlg-actions">
     <button class="btn" value="cancel" id="dlg-upload-cancel">Cancel</button>
     <button class="btn primary" id="dlg-upload-go">Upload</button>

@@ -1,12 +1,16 @@
-/* Pink Lily Receiving — scan PO → SKU → Qty, save locally, bulk upload to ShipHero.
+/* Pink Lily Receiving — scan PO → Location → SKU (→ Size) → Qty, save locally, bulk upload to ShipHero.
  *
- * Upload safety: ShipHero's purchase_order_update ADDS quantity_received on every call.
- * So each upload is a "batch" with a before-snapshot of quantity_received. If the result
- * of a call is unknown (dropped connection, server error), the batch is locked and we
- * re-read the PO before ever sending it again:
- *   all lines == before + qty  → it went through, mark done
- *   all lines == before        → it did not go through, safe to resend
- *   anything else              → flag for manual review in ShipHero (never auto-resend)
+ * On start the app preloads every open (pending) PO with its lines, so scanning a PO is instant.
+ *
+ * Upload = for each PO + location group ("batch"):
+ *   1. inventory_add each line into the scanned location. Every add carries a unique tag in its
+ *      reason, e.g. "PL Receiving · PO 1105736 · Receiving · JD [PLR-k3x9a1b2c3.4]".
+ *   2. purchase_order_update to add the same quantities to Quantity received.
+ * Each step's state is saved on the device before and after it runs. If a result is unknown
+ * (dropped connection, server error, app closed), nothing is resent blindly:
+ *   - an inventory add is checked in ShipHero's inventory history by its tag
+ *   - the PO update is checked against a before-snapshot of quantity_received
+ *     (all == before + qty → done · all == before → resend · otherwise → manual review)
  */
 (function () {
   "use strict";
@@ -15,9 +19,14 @@
   const API = "/api/shiphero";
   const MAX_QTY = 9999;
   const HISTORY_DAYS = 30;
+  const CACHE_FRESH_MS = 2 * 3600e3;   // a preloaded PO is used instantly if younger than this
+  const RESYNC_MS = 30 * 60e3;          // re-pull open POs every 30 min while the app is open
 
   // ---------------------------------------------------------------- storage
-  const blank = () => ({ pos: {}, scans: [], batches: [], settings: { pin: "", receiver: "", sound: true } });
+  const blank = () => ({
+    pos: {}, scans: [], batches: [], poLoc: {}, locs: {}, open: { keys: [], at: 0 },
+    settings: { pin: "", receiver: "", sound: true },
+  });
   let S = load();
   function load() {
     try {
@@ -35,8 +44,12 @@
   function prune() {
     const cutoff = Date.now() - HISTORY_DAYS * 864e5;
     S.batches = S.batches.filter((b) => b.state !== "done" || b.ts > cutoff);
-    const live = new Set(S.scans.map((x) => x.po).concat(S.batches.filter((b) => b.state !== "done").map((b) => b.po)));
-    for (const k of Object.keys(S.pos)) if (!live.has(k) && S.pos[k].fetchedAt < cutoff) delete S.pos[k];
+    const live = new Set(S.scans.map((x) => x.po)
+      .concat(S.batches.filter((b) => b.state !== "done").map((b) => b.po))
+      .concat(S.open.keys));
+    if (cur.po) live.add(cur.po); // prune only runs after boot, so cur exists
+    for (const k of Object.keys(S.pos)) if (!live.has(k)) delete S.pos[k];
+    for (const k of Object.keys(S.poLoc)) if (!live.has(k)) delete S.poLoc[k];
   }
 
   // ---------------------------------------------------------------- helpers
@@ -45,6 +58,7 @@
   const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const fmtTime = (t) => new Date(t).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   let audioCtx = null;
   function beep(kind) {
@@ -70,24 +84,28 @@
   }
 
   class ApiError extends Error {
-    constructor(msg, status, network) { super(msg); this.status = status; this.network = !!network; }
+    constructor(msg, status, network, retryAfter) { super(msg); this.status = status; this.network = !!network; this.retryAfter = retryAfter; }
   }
-  async function api(action, payload) {
-    let res;
-    try {
-      res = await fetch(API, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "x-app-pin": S.settings.pin || "" },
-        body: JSON.stringify(Object.assign({ action }, payload || {})),
-      });
-    } catch (e) {
-      throw new ApiError("No connection to the server.", 0, true);
+  async function api(action, payload, opts) {
+    const tries = (opts && opts.retries) || 0;
+    for (let attempt = 0; ; attempt++) {
+      let res;
+      try {
+        res = await fetch(API, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-app-pin": S.settings.pin || "" },
+          body: JSON.stringify(Object.assign({ action }, payload || {})),
+        });
+      } catch (e) {
+        throw new ApiError("No connection to the server.", 0, true);
+      }
+      let body = null;
+      try { body = await res.json(); } catch (e) {}
+      if (res.status === 401) { openSettings("Enter the app PIN to connect."); throw new ApiError("App PIN needed.", 401); }
+      if (res.status === 429 && attempt < tries) { await sleep(Math.min(((body && body.retry_after) || 5) + 1, 90) * 1000); continue; }
+      if (!res.ok) throw new ApiError((body && body.error) || `Server error (HTTP ${res.status}).`, res.status, false, body && body.retry_after);
+      return body;
     }
-    let body = null;
-    try { body = await res.json(); } catch (e) {}
-    if (res.status === 401) { openSettings("Enter the app PIN to connect."); throw new ApiError("App PIN needed.", 401); }
-    if (!res.ok) throw new ApiError((body && body.error) || `Server error (HTTP ${res.status}).`, res.status);
-    return body;
   }
 
   // ---------------------------------------------------------------- PO data
@@ -103,7 +121,7 @@
   const compact = (v) => norm(v).replace(/[\s\-_.\/]/g, "");
   const SIZE_ALIASES = {
     XXSMALL: "XXS", "2XS": "XXS", XSMALL: "XS", EXTRASMALL: "XS", XSM: "XS",
-    SMALL: "S", SM: "S", SML: "S", MEDIUM: "M", MED: "M", MD: "M", LARGE: "L", LG: "L", LRG: "L",
+    SMALL: "S", SM: "S", SML: "S", MEDIUM: "M", MED: "M", MD: "M", LARGE: "L", LG: "L", LRG: "L", LAR: "L", SMA: "S",
     XLARGE: "XL", EXTRALARGE: "XL", XLG: "XL", XXL: "2XL", XXLARGE: "2XL", XXXL: "3XL",
     "1XL": "1X", ONESIZE: "OS", OSFA: "OS", ONE: "OS",
   };
@@ -112,7 +130,6 @@
     if (/^\d+$/.test(s)) s = String(parseInt(s, 10)); // "08" → "8"
     return SIZE_ALIASES[s] || s;
   }
-  // PO lines whose SKU starts with the scanned base (and is longer than it)
   function baseCandidates(po, code) {
     const b = compact(code);
     if (!po || b.length < 2) return [];
@@ -128,11 +145,13 @@
     return hits;
   }
 
+  const ACTIVE = new Set(["queued", "sending", "unknown", "review"]);
   function pendingQty(poKey, sku) {
     const s = norm(sku);
     let n = 0;
     for (const x of S.scans) if (x.po === poKey && norm(x.sku) === s) n += x.qty;
-    for (const b of S.batches) if (b.po === poKey && (b.state === "unknown" || b.state === "sending" || b.state === "review"))
+    // units in a batch whose PO step hasn't been confirmed yet
+    for (const b of S.batches) if (b.po === poKey && ACTIVE.has(b.state) && b.poStep !== "done")
       for (const l of b.lines) if (norm(l.sku) === s) n += l.qty;
     return n;
   }
@@ -142,25 +161,71 @@
     return key;
   }
 
+  // ---------------------------------------------------------------- open-PO preload
+  let syncing = false;
+  async function syncOpenPOs(manual) {
+    if (syncing) return;
+    syncing = true;
+    $("btn-sync").classList.add("busy");
+    const keys = [];
+    let after = null, page = 0;
+    try {
+      do {
+        $("sync-status").textContent = `Loading open POs… ${keys.length}`;
+        const r = await api("openPOs", { after }, { retries: 4 });
+        for (const po of r.pos) {
+          const k = norm(po.po_number);
+          // don't clobber a fuller copy fetched by a scan (POs with >100 lines)
+          if (po.complete === false && S.pos[k] && S.pos[k].complete !== false) { S.pos[k].fetchedAt = Date.now(); }
+          else applyPO(po);
+          keys.push(k);
+        }
+        after = r.next; page++;
+        if (after) await sleep(800); // be gentle with the shared ShipHero credit pool
+      } while (after && page < 40);
+      S.open = { keys, at: Date.now() };
+      prune(); save();
+      renderOpenList();
+      if (manual) say("ok", `Loaded ${keys.length} open POs.`);
+    } catch (e) {
+      $("sync-status").textContent = S.open.at ? `Open POs: ${S.open.keys.length} (sync failed)` : "Open POs: couldn't load";
+      if (manual) say("warn", `Couldn't load open POs: ${e.message}`);
+    } finally {
+      syncing = false;
+      $("btn-sync").classList.remove("busy");
+    }
+  }
+  function renderOpenList() {
+    const n = S.open.keys.length;
+    $("sync-status").textContent = S.open.at
+      ? `${n} open PO${n === 1 ? "" : "s"} · ${new Date(S.open.at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`
+      : "Open POs: —";
+    $("open-pos").innerHTML = S.open.keys.map((k) => {
+      const p = S.pos[k]; if (!p) return "";
+      return `<option value="${esc(p.po_number)}">${esc(p.vendor || "")}</option>`;
+    }).join("");
+  }
+
   // ---------------------------------------------------------------- scan flow
   const cur = { po: null, line: null, overConfirm: null, base: null, cands: null, step: "po" };
+  const STEPS = ["po", "loc", "sku", "size", "qty"];
 
   function setStep(step) {
     cur.step = step;
-    const order = ["po", "sku", "size", "qty"];
     const sizeUsed = !!cur.base;
     document.querySelectorAll(".steps li").forEach((li) => {
-      const i = order.indexOf(li.dataset.step), j = order.indexOf(step);
+      const i = STEPS.indexOf(li.dataset.step), j = STEPS.indexOf(step);
       li.classList.toggle("active", i === j);
       li.classList.toggle("done", i < j && (li.dataset.step !== "size" || sizeUsed));
       li.classList.toggle("skipped", li.dataset.step === "size" && j > i && !sizeUsed);
     });
-    $("in-sku").disabled = step === "po";
+    $("in-loc").disabled = step !== "loc";
+    $("in-sku").disabled = !(step === "sku" || step === "size" || step === "qty");
     $("in-size").disabled = step !== "size";
     $("size-wrap").hidden = !(step === "size" || (step === "qty" && sizeUsed));
     $("in-qty").disabled = step !== "qty";
     $("btn-save").disabled = step !== "qty";
-    const target = { po: "in-po", sku: "in-sku", size: "in-size", qty: "in-qty" }[step];
+    const target = { po: "in-po", loc: "in-loc", sku: "in-sku", size: "in-size", qty: "in-qty" }[step];
     // focus synchronously: a scanner can send the next code within milliseconds
     $(target).focus(); $(target).select();
   }
@@ -169,36 +234,56 @@
     const num = String(raw || "").trim();
     if (!num) return;
     const key = norm(num);
+    const cached = S.pos[key];
+    // Preloaded and fresh → instant; refresh quietly in the background
+    if (cached && cached.complete !== false && Date.now() - cached.fetchedAt < CACHE_FRESH_MS) {
+      cur.po = key;
+      onPOReady("cached");
+      api("getPO", { id: cached.id }).then(({ po }) => {
+        applyPO(po); save();
+        if (cur.po === key) { renderPOCard(); if (cur.line) { cur.line = lineFor(S.pos[key], cur.line.sku) || cur.line; renderLineCard(); } }
+      }).catch(() => {});
+      return;
+    }
     say("", `Looking up PO ${num}…`);
     $("btn-po").disabled = true;
     try {
       const { po } = await api("getPO", { po_number: num });
       cur.po = applyPO(po); save();
-      onPOReady(false);
+      onPOReady("live");
     } catch (e) {
-      if (e.network && S.pos[key]) {
+      if (e.network && cached) {
         cur.po = key;
-        onPOReady(true);
+        onPOReady("offline");
       } else {
         cur.po = null; beep("err");
-        say("err", e.network ? `Offline and PO ${num} hasn't been loaded on this device before. Reconnect and rescan.` : e.message);
-        $("po-card").hidden = true;
+        say("err", e.network ? `Offline and PO ${num} isn't saved on this device. Reconnect and rescan.` : e.message);
+        $("po-card").hidden = true; $("loc-card").hidden = true;
         setStep("po");
       }
     } finally { $("btn-po").disabled = false; }
   }
 
-  function onPOReady(offline) {
+  function onPOReady(how) {
     const po = S.pos[cur.po];
     const closed = /closed|cancel/i.test(po.status || "");
     beep(closed ? "err" : "ok");
     renderPOCard();
-    if (closed) say("warn", `PO ${po.po_number} is ${po.status} in ShipHero. Scans will be saved but the upload may be rejected.`);
-    else say(offline ? "warn" : "ok", offline ? `Offline — using saved copy of PO ${po.po_number}. Scan a SKU.` : `PO ${po.po_number} loaded. Scan a SKU.`);
     $("in-po").value = po.po_number;
-    cur.line = null; cur.base = null; cur.cands = null; $("line-card").hidden = true; $("in-sku").value = ""; $("in-size").value = ""; $("in-qty").value = "";
+    cur.line = null; cur.base = null; cur.cands = null;
+    $("line-card").hidden = true; $("in-sku").value = ""; $("in-size").value = ""; $("in-qty").value = ""; $("in-loc").value = "";
     renderRecent();
-    setStep("sku");
+    const loc = S.poLoc[cur.po];
+    renderLocCard();
+    const pre = closed ? `PO ${po.po_number} is ${po.status} in ShipHero — the upload may be rejected. `
+      : how === "offline" ? `Offline — using saved copy of PO ${po.po_number}. ` : `PO ${po.po_number} ready. `;
+    if (loc) {
+      say(closed || how === "offline" ? "warn" : "ok", `${pre}Putting away to ${loc.name}. Scan a SKU.`);
+      setStep("sku");
+    } else {
+      say(closed || how === "offline" ? "warn" : "ok", `${pre}Scan the location this PO is going to.`);
+      setStep("loc");
+    }
   }
 
   function renderPOCard() {
@@ -212,7 +297,47 @@
       <span>Received ${received} / ${ordered}</span></div>
       <button class="link" id="btn-change-po">Change PO</button>`;
     $("po-card").hidden = false;
-    $("btn-change-po").onclick = () => { cur.po = null; cur.line = null; cur.base = null; cur.cands = null; $("in-po").value = ""; $("po-card").hidden = true; $("line-card").hidden = true; $("recent-wrap").hidden = true; say("", "Scan a PO number to start."); setStep("po"); };
+    $("btn-change-po").onclick = () => {
+      cur.po = null; cur.line = null; cur.base = null; cur.cands = null;
+      $("in-po").value = ""; $("po-card").hidden = true; $("loc-card").hidden = true; $("line-card").hidden = true; $("recent-wrap").hidden = true;
+      say("", "Scan a PO number to start."); setStep("po");
+    };
+  }
+
+  function renderLocCard() {
+    const loc = cur.po && S.poLoc[cur.po];
+    if (!loc) { $("loc-card").hidden = true; return; }
+    $("loc-card").innerHTML = `<span>→ ${esc(loc.name)}<div class="sub">${loc.sellable ? "Sellable" : "Not sellable"} · ${loc.pickable ? "pickable" : "not pickable"}</div></span>
+      <button class="link" id="btn-change-loc">Change</button>`;
+    $("loc-card").hidden = false;
+    $("btn-change-loc").onclick = () => { $("in-loc").value = ""; say("", "Scan the new location."); setStep("loc"); };
+  }
+
+  async function onLoc(raw) {
+    const name = String(raw || "").trim();
+    if (!name) return;
+    const po = S.pos[cur.po];
+    if (!po) { setStep("po"); return; }
+    if (lineFor(po, name) || baseCandidates(po, name).length) {
+      beep("err"); say("err", `That looks like a SKU (${name}). Scan the location barcode first.`); $("in-loc").select(); return;
+    }
+    const ck = `${po.warehouse_id || ""}|${norm(name)}`;
+    say("", `Checking location ${name}…`);
+    let loc = null;
+    try {
+      loc = (await api("getLocation", { name, warehouse_id: po.warehouse_id })).location;
+      S.locs[ck] = loc;
+    } catch (e) {
+      if (e.network && S.locs[ck]) loc = S.locs[ck];
+      else { beep("err"); say("err", e.network ? `Offline and location ${name} isn't saved on this device.` : e.message); $("in-loc").select(); return; }
+    }
+    S.poLoc[cur.po] = { id: loc.id, name: loc.name, sellable: loc.sellable, pickable: loc.pickable };
+    save();
+    renderLocCard();
+    $("in-loc").value = loc.name;
+    beep("ok");
+    say("ok", `Putting away to ${loc.name}. Scan a SKU.`);
+    setStep("sku");
   }
 
   function onSku(raw) {
@@ -220,10 +345,10 @@
     if (!code) return;
     const po = S.pos[cur.po];
     if (!po) { setStep("po"); return; }
+    if (!S.poLoc[cur.po]) { setStep("loc"); return; }
     cur.base = null; cur.cands = null; $("in-size").value = "";
     const line = lineFor(po, code);
     if (!line) {
-      // Split label? base SKU here, size on its own barcode
       const cands = baseCandidates(po, code);
       if (cands.length) {
         cur.base = code; cur.cands = cands; cur.line = null;
@@ -265,15 +390,10 @@
     const v = String(raw || "").trim();
     if (!v || !cur.cands) return;
     const po = S.pos[cur.po];
-    // a full SKU scanned here still works
     const exact = lineFor(po, v);
     if (exact) { cur.base = null; cur.cands = null; $("in-sku").value = exact.sku; pickLine(exact); return; }
     const hits = resolveSize(cur.base, cur.cands, v);
-    if (hits.length === 1) {
-      $("in-size").value = canonSize(v);
-      pickLine(hits[0]);
-      return;
-    }
+    if (hits.length === 1) { $("in-size").value = canonSize(v); pickLine(hits[0]); return; }
     beep("err");
     const sizes = cur.cands.map((l) => sizeOf(l, cur.base) || l.option_title).join(", ");
     say("err", hits.length > 1
@@ -283,7 +403,7 @@
   }
 
   function renderLineCard(extra) {
-    const po = S.pos[cur.po], l = cur.line;
+    const l = cur.line;
     if (!l) { $("line-card").hidden = true; return; }
     const pend = pendingQty(cur.po, l.sku) + (extra || 0);
     const remaining = l.ordered - l.received - pend;
@@ -299,8 +419,9 @@
 
   function onQty(raw) {
     const v = String(raw || "").trim();
-    const po = S.pos[cur.po], l = cur.line;
+    const po = S.pos[cur.po], l = cur.line, loc = S.poLoc[cur.po];
     if (!po || !l) { setStep("sku"); return; }
+    if (!loc) { setStep("loc"); return; }
     if (!v) return;
     if (lineFor(po, v)) { beep("err"); say("err", `That's a SKU (${v}), not a quantity. Scan or type the quantity.`); $("in-qty").select(); return; }
     if (!/^\d+$/.test(v)) { beep("err"); say("err", `"${v}" isn't a quantity. Use whole numbers only.`); $("in-qty").select(); return; }
@@ -315,10 +436,10 @@
       say("warn", `That's ${qty - Math.max(remaining, 0)} over the PO. Press Enter again to save anyway, or fix the qty.`);
       return;
     }
-    S.scans.push({ id: uid(), po: cur.po, sku: l.sku, qty, ts: Date.now(), by: S.settings.receiver || "" });
+    S.scans.push({ id: uid(), po: cur.po, sku: l.sku, qty, loc: { id: loc.id, name: loc.name }, ts: Date.now(), by: S.settings.receiver || "" });
     save();
     beep("save");
-    say("ok", `Saved ${qty} × ${l.sku}. Scan the next SKU.`);
+    say("ok", `Saved ${qty} × ${l.sku} → ${loc.name}. Scan the next SKU.`);
     cur.overConfirm = null;
     renderLineCard();
     renderRecent(); renderBadge();
@@ -330,7 +451,7 @@
   function renderRecent() {
     const list = S.scans.filter((x) => x.po === cur.po).slice(-5).reverse();
     $("recent-wrap").hidden = !list.length;
-    $("recent").innerHTML = list.map((x) => `<li><span class="mono">${esc(x.sku)}</span><span><b>${x.qty}</b> · ${fmtTime(x.ts)}</span></li>`).join("");
+    $("recent").innerHTML = list.map((x) => `<li><span class="mono">${esc(x.sku)}</span><span><b>${x.qty}</b> → ${esc(x.loc ? x.loc.name : "?")} · ${fmtTime(x.ts)}</span></li>`).join("");
   }
 
   function undoLast() {
@@ -346,12 +467,14 @@
   }
 
   // ---------------------------------------------------------------- saved view
+  const gkey = (x) => `${x.po}|${x.loc ? x.loc.id : "none"}`;
   function groupPending() {
     const groups = {};
     for (const x of S.scans) {
-      const g = groups[x.po] || (groups[x.po] = { po: x.po, lines: {}, units: 0 });
-      const k = norm(x.sku);
-      const ln = g.lines[k] || (g.lines[k] = { sku: x.sku, qty: 0, scans: 0 });
+      const k = gkey(x);
+      const g = groups[k] || (groups[k] = { key: k, po: x.po, loc: x.loc || null, lines: {}, units: 0 });
+      const sk = norm(x.sku);
+      const ln = g.lines[sk] || (g.lines[sk] = { sku: x.sku, qty: 0, scans: 0 });
       ln.qty += x.qty; ln.scans++; g.units += x.qty;
     }
     return groups;
@@ -364,14 +487,20 @@
     $("btn-upload").disabled = !n || uploading;
   }
 
+  function stepText(b) {
+    const inv = b.lines.filter((l) => l.inv === "done").length;
+    return `Inventory added: ${inv}/${b.lines.length} lines · PO updated: ${b.poStep === "done" ? "yes" : "no"}`;
+  }
+
   function renderSaved() {
     const groups = groupPending();
     const keys = Object.keys(groups);
     const alerts = S.batches.filter((b) => b.state === "unknown" || b.state === "review");
     $("batch-alerts").innerHTML = alerts.map((b) => `
       <div class="alert ${b.state === "review" ? "err" : "warn"}">
-        <b>PO ${esc(b.po_number)} — ${b.state === "review" ? "needs a manual check" : "upload result unknown"}</b>
+        <b>PO ${esc(b.po_number)} → ${esc(b.location ? b.location.name : "?")} — ${b.state === "review" ? "needs a manual check" : "upload not finished"}</b>
         <div>${esc(b.error || "")}</div>
+        <div class="hint">${stepText(b)}</div>
         <div>${b.lines.map((l) => `${esc(l.sku)} × ${l.qty}`).join(", ")}</div>
         <div class="acts">
           ${b.state === "unknown" ? `<button class="btn sm primary" data-verify="${b.id}">Check ShipHero &amp; finish</button>` : ""}
@@ -383,19 +512,20 @@
       $("saved-list").innerHTML = `<div class="empty">No saved scans waiting to upload.</div>`;
     } else {
       $("saved-list").innerHTML = keys.map((k) => {
-        const g = groups[k], po = S.pos[k] || { po_number: k, lines: [] };
+        const g = groups[k], po = S.pos[g.po] || { po_number: g.po, lines: [] };
         const rows = Object.values(g.lines).map((ln) => {
           const pl = lineFor(po, ln.sku) || { ordered: 0, received: 0, name: "" };
-          const after = pl.received + pendingQty(k, ln.sku);
+          const after = pl.received + pendingQty(g.po, ln.sku);
           const over = after - pl.ordered;
           return `<tr><td><span class="mono">${esc(ln.sku)}</span>${over > 0 ? `<span class="over-tag">+${over} over</span>` : ""}<div class="sub">${esc(pl.name || "")}</div></td>
             <td class="num"><b>${ln.qty}</b><div class="sub">${ln.scans} scan${ln.scans > 1 ? "s" : ""}</div></td>
             <td class="num">${pl.received} → ${after}<div class="sub">of ${pl.ordered}</div></td>
-            <td class="num"><button class="link" data-del-sku="${esc(k)}|${esc(ln.sku)}" aria-label="Remove">✕</button></td></tr>`;
+            <td class="num"><button class="link" data-del-sku="${esc(k)}" data-sku="${esc(ln.sku)}" aria-label="Remove">✕</button></td></tr>`;
         }).join("");
         return `<div class="card po-block">
-          <div class="card-head"><div><h3>PO ${esc(po.po_number)}</h3><div class="meta">${esc(po.vendor || "")} · ${Object.keys(g.lines).length} SKUs · ${g.units} units</div></div>
-          <button class="btn sm danger" data-del-po="${esc(k)}">Remove PO</button></div>
+          <div class="card-head"><div><h3>PO ${esc(po.po_number)} <span class="loc-tag">→ ${esc(g.loc ? g.loc.name : "NO LOCATION")}</span></h3>
+          <div class="meta">${esc(po.vendor || "")} · ${Object.keys(g.lines).length} SKUs · ${g.units} units</div></div>
+          <button class="btn sm danger" data-del-po="${esc(k)}">Remove</button></div>
           <table><thead><tr><th>SKU</th><th class="num">Qty</th><th class="num">Received</th><th></th></tr></thead><tbody>${rows}</tbody></table>
         </div>`;
       }).join("");
@@ -407,20 +537,20 @@
     const t = e.target.closest("button");
     if (!t) return;
     if (t.dataset.delSku) {
-      const [po, sku] = t.dataset.delSku.split("|");
-      S.scans = S.scans.filter((x) => !(x.po === po && norm(x.sku) === norm(sku)));
+      const k = t.dataset.delSku, sku = norm(t.dataset.sku);
+      S.scans = S.scans.filter((x) => !(gkey(x) === k && norm(x.sku) === sku));
       save(); renderSaved();
     } else if (t.dataset.delPo) {
-      const po = t.dataset.delPo;
+      const k = t.dataset.delPo;
       if (t.dataset.armed !== "1") { t.dataset.armed = "1"; t.textContent = "Tap again to remove"; return; }
-      S.scans = S.scans.filter((x) => x.po !== po);
+      S.scans = S.scans.filter((x) => gkey(x) !== k);
       save(); renderSaved();
     } else if (t.dataset.verify) {
       runBatches([S.batches.find((b) => b.id === t.dataset.verify)]);
     } else if (t.dataset.resolve) {
       const b = S.batches.find((x) => x.id === t.dataset.resolve);
       if (t.dataset.armed !== "1") { t.dataset.armed = "1"; t.textContent = "Confirm: fixed in ShipHero"; return; }
-      b.state = "done"; b.error = "Marked fixed manually."; b.request_id = b.request_id || "manual";
+      b.state = "done"; b.error = "Marked fixed manually."; b.ts = Date.now();
       save(); renderSaved();
     }
   }
@@ -429,12 +559,12 @@
   let uploading = false;
 
   function openUpload() {
-    const groups = groupPending();
-    const keys = Object.keys(groups);
-    if (!keys.length) return;
-    const units = keys.reduce((a, k) => a + groups[k].units, 0);
-    $("upload-summary").innerHTML = `<p><b>${keys.length}</b> PO${keys.length > 1 ? "s" : ""} · <b>${keys.reduce((a, k) => a + Object.keys(groups[k].lines).length, 0)}</b> lines · <b>${units}</b> units</p>
-      <ul>${keys.map((k) => `<li>PO ${esc((S.pos[k] || {}).po_number || k)} — ${groups[k].units} units</li>`).join("")}</ul>`;
+    const groups = Object.values(groupPending());
+    if (!groups.length) return;
+    const units = groups.reduce((a, g) => a + g.units, 0);
+    const lines = groups.reduce((a, g) => a + Object.keys(g.lines).length, 0);
+    $("upload-summary").innerHTML = `<p><b>${groups.length}</b> PO/location group${groups.length > 1 ? "s" : ""} · <b>${lines}</b> lines · <b>${units}</b> units</p>
+      <ul>${groups.map((g) => `<li>PO ${esc((S.pos[g.po] || {}).po_number || g.po)} → ${esc(g.loc ? g.loc.name : "NO LOCATION")} — ${g.units} units</li>`).join("")}</ul>`;
     $("dlg-upload").showModal();
   }
 
@@ -443,14 +573,15 @@
     const groups = groupPending();
     const batches = [];
     for (const k of Object.keys(groups)) {
-      const po = S.pos[k];
+      const g = groups[k], po = S.pos[g.po];
       const b = {
-        id: uid(), po: k, po_id: po && po.id, po_number: (po && po.po_number) || k,
-        lines: Object.values(groups[k].lines).map((l) => ({ sku: l.sku, qty: l.qty })),
-        scans: S.scans.filter((x) => x.po === k),
+        id: uid(), tag: uid().replace(/[^a-z0-9]/g, ""), po: g.po, po_id: po && po.id, po_number: (po && po.po_number) || g.po,
+        warehouse_id: po && po.warehouse_id, location: g.loc,
+        lines: Object.values(g.lines).map((l) => ({ sku: l.sku, qty: l.qty, inv: "pending" })),
+        poStep: "pending", scans: S.scans.filter((x) => gkey(x) === k),
         before: null, state: "queued", ts: Date.now(), by: S.settings.receiver || "",
       };
-      S.scans = S.scans.filter((x) => x.po !== k);
+      S.scans = S.scans.filter((x) => gkey(x) !== k);
       S.batches.push(b); batches.push(b);
     }
     save(); renderSaved();
@@ -458,9 +589,16 @@
   }
 
   function releaseBatch(b, msg) {
-    // definitely NOT applied in ShipHero → put scans back in the queue
+    // nothing from this batch reached ShipHero → put the scans back in the queue
     S.scans = S.scans.concat(b.scans || []);
     b.state = "failed"; b.error = msg; b.ts = Date.now();
+  }
+  const anyApplied = (b) => b.poStep !== "pending" || b.lines.some((l) => l.inv !== "pending");
+  function stopBatch(b, msg, definite) {
+    // definite = ShipHero rejected the step, so it didn't happen
+    if (definite && !anyApplied(b)) return releaseBatch(b, msg);
+    b.state = definite ? "review" : "unknown";
+    b.error = msg;
   }
 
   async function runBatches(list) {
@@ -480,29 +618,63 @@
     }
     const parts = [];
     if (results.done) parts.push(`${results.done} uploaded`);
-    if (results.failed) parts.push(`${results.failed} failed (scans kept)`);
-    if (results.unknown) parts.push(`${results.unknown} unconfirmed`);
+    if (results.failed) parts.push(`${results.failed} not sent (scans kept)`);
+    if (results.unknown) parts.push(`${results.unknown} not finished`);
     if (results.review) parts.push(`${results.review} need review`);
     const bad = results.failed || results.unknown || results.review;
     beep(bad ? "err" : "save");
     say(bad ? "warn" : "ok", `Upload finished: ${parts.join(", ") || "nothing to do"}.`);
-    toast(bad ? "warn" : "ok", `Upload finished: ${parts.join(", ")}.`);
   }
 
+  const lineTag = (b, i) => `[PLR-${b.tag}.${i}]`;
+  const lineReason = (b, i) => `PL Receiving · PO ${b.po_number} · ${b.location.name} · ${b.by || "-"} ${lineTag(b, i)}`.slice(0, 200);
+
   async function runOne(b) {
-    // 1. Fresh read of the PO (also gives us the before-snapshot / verification data)
+    if (!b.location || !b.location.id) return releaseBatch(b, "No location on these scans. Remove them, scan the PO's location, and rescan.");
+
+    // 1. Fresh read of the PO (validation + snapshot for verifying the PO step)
     let po;
     try {
-      po = (await api("getPO", b.po_id ? { id: b.po_id } : { po_number: b.po_number })).po;
+      po = (await api("getPO", b.po_id ? { id: b.po_id } : { po_number: b.po_number }, { retries: 3 })).po;
       applyPO(po);
-      b.po_id = po.id;
+      b.po_id = po.id; b.warehouse_id = po.warehouse_id;
     } catch (e) {
-      if (b.state === "unknown") { b.error = `Couldn't check ShipHero: ${e.message}`; return; }
-      return releaseBatch(b, `Couldn't read PO before upload: ${e.message}`);
+      return stopBatch(b, `Couldn't read the PO from ShipHero: ${e.message}`, !anyApplied(b) && !e.network);
+    }
+    if (!b.before) {
+      const missing = b.lines.filter((l) => !lineFor(po, l.sku));
+      if (missing.length) return releaseBatch(b, `Not on PO ${po.po_number}: ${missing.map((m) => m.sku).join(", ")}. Remove them and upload again.`);
+      b.before = {};
+      b.lines = b.lines.map((l) => { const pl = lineFor(po, l.sku); b.before[norm(pl.sku)] = pl.received; return Object.assign(l, { sku: pl.sku }); });
+    }
+    b.state = "sending"; save();
+
+    // 2. Add inventory to the location, one line at a time
+    for (let i = 0; i < b.lines.length; i++) {
+      const l = b.lines[i];
+      if (l.inv === "done") continue;
+      if (l.inv === "unknown" || l.inv === "sending") {
+        try {
+          const r = await api("findChange", { sku: l.sku, tag: lineTag(b, i), warehouse_id: b.warehouse_id, since: b.ts }, { retries: 3 });
+          if (r.found > 0) { l.inv = "done"; save(); continue; }
+        } catch (e) { return stopBatch(b, `Couldn't check inventory history for ${l.sku}: ${e.message}`, false); }
+      }
+      say("", `PO ${b.po_number}: adding ${l.qty} × ${l.sku} to ${b.location.name}…`);
+      l.inv = "sending"; save();
+      try {
+        const r = await api("addInventory", {
+          sku: l.sku, warehouse_id: b.warehouse_id, location_id: b.location.id, quantity: l.qty, reason: lineReason(b, i),
+        });
+        l.inv = "done"; l.request_id = r.request_id; save();
+      } catch (e) {
+        const definite = e.status === 400 || e.status === 401 || e.status === 404 || e.status === 429;
+        l.inv = definite ? "pending" : "unknown";
+        return stopBatch(b, `Adding ${l.sku} to ${b.location.name} failed: ${e.message}`, definite);
+      }
     }
 
-    // 2. A previous attempt with unknown result → verify instead of blindly resending
-    if (b.state === "unknown" && b.before) {
+    // 3. Add the quantities to Quantity received on the PO
+    if (b.poStep === "unknown" || b.poStep === "sending") {
       let applied = true, untouched = true;
       for (const l of b.lines) {
         const pl = lineFor(po, l.sku); const now = pl ? pl.received : -1;
@@ -510,30 +682,24 @@
         if (now !== was + l.qty) applied = false;
         if (now !== was) untouched = false;
       }
-      if (applied) { b.state = "done"; b.error = "Confirmed in ShipHero after a dropped connection."; b.ts = Date.now(); return; }
-      if (!untouched) { b.state = "review"; b.error = "Received quantities changed but don't match this upload. Check the PO in ShipHero, then mark it fixed."; return; }
-      // untouched → fall through and send
+      if (applied) { b.poStep = "done"; }
+      else if (!untouched) { return stopBatch(b, "Inventory was added, but the PO's received counts changed in a way that doesn't match this upload. Check the PO in ShipHero, then mark it fixed.", true); }
+      else b.poStep = "pending";
     }
-
-    // 3. Validate every SKU is on the PO
-    const missing = b.lines.filter((l) => !lineFor(po, l.sku));
-    if (missing.length) return releaseBatch(b, `Not on PO ${po.po_number}: ${missing.map((m) => m.sku).join(", ")}. Remove them and upload again.`);
-
-    // canonicalize SKUs to ShipHero's spelling + snapshot
-    b.before = {};
-    b.lines = b.lines.map((l) => { const pl = lineFor(po, l.sku); b.before[norm(pl.sku)] = pl.received; return { sku: pl.sku, qty: l.qty }; });
-    b.state = "sending"; save();
-
-    // 4. Send
-    try {
-      const r = await api("receive", { po_id: b.po_id, line_items: b.lines.map((l) => ({ sku: l.sku, quantity_received: l.qty })) });
-      b.state = "done"; b.request_id = r.request_id; b.ts = Date.now(); b.error = "";
-      // reflect locally so the line cards are right without a reload
-      for (const l of b.lines) { const pl = lineFor(S.pos[b.po], l.sku); if (pl) pl.received += l.qty; }
-    } catch (e) {
-      if (e.status === 400 || e.status === 401 || e.status === 404) return releaseBatch(b, e.message); // rejected before ShipHero
-      b.state = "unknown"; b.error = e.message;
+    if (b.poStep !== "done") {
+      b.poStep = "sending"; save();
+      try {
+        const r = await api("receive", { po_id: b.po_id, line_items: b.lines.map((l) => ({ sku: l.sku, quantity_received: l.qty })) });
+        b.poStep = "done"; b.request_id = r.request_id;
+      } catch (e) {
+        const definite = e.status === 400 || e.status === 401 || e.status === 404 || e.status === 429;
+        b.poStep = definite ? "pending" : "unknown";
+        return stopBatch(b, `Inventory was added, but updating the PO failed: ${e.message}`, definite);
+      }
     }
+    b.state = "done"; b.ts = Date.now(); b.error = "";
+    for (const l of b.lines) { const pl = lineFor(S.pos[b.po], l.sku); if (pl) pl.received += l.qty; }
+    save();
   }
 
   // ---------------------------------------------------------------- history
@@ -541,18 +707,19 @@
     const list = S.batches.filter((b) => b.state !== "queued").slice().reverse();
     $("history-list").innerHTML = list.length ? list.map((b) => `
       <div class="card hist">
-        <div class="top"><b>PO ${esc(b.po_number)}</b><span class="pill ${b.state}">${{ done: "Uploaded", failed: "Not sent", unknown: "Unconfirmed", review: "Needs review", sending: "Sending" }[b.state] || b.state}</span></div>
-        <div class="hint">${fmtTime(b.ts)}${b.by ? " · " + esc(b.by) : ""}${b.request_id ? " · req " + esc(b.request_id) : ""}</div>
+        <div class="top"><b>PO ${esc(b.po_number)}${b.location ? ` → ${esc(b.location.name)}` : ""}</b><span class="pill ${b.state}">${{ done: "Uploaded", failed: "Not sent", unknown: "Not finished", review: "Needs review", sending: "Sending" }[b.state] || b.state}</span></div>
+        <div class="hint">${fmtTime(b.ts)}${b.by ? " · " + esc(b.by) : ""}${b.tag ? " · PLR-" + esc(b.tag) : ""}</div>
         <div>${b.lines.map((l) => `<span class="mono">${esc(l.sku)}</span> × ${l.qty}`).join(" · ")}</div>
+        ${b.state !== "done" && b.lines[0] && b.lines[0].inv ? `<div class="hint">${stepText(b)}</div>` : ""}
         ${b.error ? `<div class="hint">${esc(b.error)}</div>` : ""}
       </div>`).join("") : `<div class="empty">No uploads yet.</div>`;
   }
 
   // ---------------------------------------------------------------- CSV export
   function exportCSV() {
-    const rows = [["status", "po_number", "sku", "qty", "scanned_at", "receiver", "request_id"]];
-    for (const x of S.scans) rows.push(["pending", (S.pos[x.po] || {}).po_number || x.po, x.sku, x.qty, new Date(x.ts).toISOString(), x.by || "", ""]);
-    for (const b of S.batches) for (const l of b.lines) rows.push([b.state, b.po_number, l.sku, l.qty, new Date(b.ts).toISOString(), b.by || "", b.request_id || ""]);
+    const rows = [["status", "po_number", "location", "sku", "qty", "scanned_at", "receiver", "tag"]];
+    for (const x of S.scans) rows.push(["pending", (S.pos[x.po] || {}).po_number || x.po, x.loc ? x.loc.name : "", x.sku, x.qty, new Date(x.ts).toISOString(), x.by || "", ""]);
+    for (const b of S.batches) b.lines.forEach((l, i) => rows.push([b.state, b.po_number, b.location ? b.location.name : "", l.sku, l.qty, new Date(b.ts).toISOString(), b.by || "", b.tag ? `PLR-${b.tag}.${i}` : ""]));
     const csv = rows.map((r) => r.map((c) => { const s = String(c); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; }).join(",")).join("\n");
     const a = document.createElement("a");
     a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
@@ -569,14 +736,13 @@
     if (!$("dlg-settings").open) $("dlg-settings").showModal();
   }
   function saveSettings() {
+    const pinChanged = $("in-pin").value.trim() !== S.settings.pin;
     S.settings.pin = $("in-pin").value.trim();
     S.settings.receiver = $("in-receiver").value.trim().toUpperCase();
     S.settings.sound = $("in-sound").checked;
     save(); $("dlg-settings").close();
-    ping();
+    if (pinChanged || !S.open.at) syncOpenPOs(false);
   }
-
-  function toast(kind, text) { if (activeTab !== "scan") say(kind, text); }
 
   let activeTab = "scan";
   function showTab(name) {
@@ -585,11 +751,10 @@
     ["scan", "saved", "history"].forEach((v) => { $("view-" + v).hidden = v !== name; });
     if (name === "saved") renderSaved();
     if (name === "history") renderHistory();
-    if (name === "scan") setStep(cur.po ? cur.step === "po" ? "sku" : cur.step : "po");
+    if (name === "scan") setStep(cur.po ? cur.step === "po" ? (S.poLoc[cur.po] ? "sku" : "loc") : cur.step : "po");
   }
 
   function setNet() { $("net").classList.toggle("off", !navigator.onLine); $("net").title = navigator.onLine ? "Online" : "Offline — scans still save"; }
-  async function ping() { try { await api("ping"); } catch (e) {} }
 
   function onEnter(el, fn) {
     el.addEventListener("keydown", (e) => {
@@ -599,16 +764,32 @@
 
   // ---------------------------------------------------------------- boot
   function boot() {
+    // migrate batches from the first version (PO update only, no inventory steps)
+    S.batches.forEach((b) => { if (!b.lines.length || b.lines[0].inv) return; if (b.state !== "done") { b.state = "review"; b.error = "Uploaded by an older version (PO only, no location). Check this PO in ShipHero."; } });
+    // any step left mid-send by a crash/reload is unknown → must be verified
+    let stuck = 0;
+    S.batches.forEach((b) => {
+      if (b.state === "sending" || b.state === "queued") {
+        b.lines.forEach((l) => { if (l.inv === "sending") l.inv = "unknown"; });
+        if (b.poStep === "sending") b.poStep = "unknown";
+        if (b.state === "queued" && !anyApplied(b)) { releaseBatch(b, "App closed before upload started."); }
+        else { b.state = "unknown"; b.error = "App closed during upload."; stuck++; }
+      }
+    });
     prune(); save();
+
     onEnter($("in-po"), loadPO);
+    onEnter($("in-loc"), onLoc);
     onEnter($("in-sku"), onSku);
     onEnter($("in-size"), onSize);
     onEnter($("in-qty"), onQty);
+    $("in-po").addEventListener("change", () => { const v = $("in-po").value; if (S.pos[norm(v)] && document.activeElement === $("in-po")) loadPO(v); });
     $("size-opts").addEventListener("click", (e) => {
       const b = e.target.closest("button[data-cand]");
       if (b && cur.cands) pickLine(cur.cands[+b.dataset.cand]);
     });
     $("btn-po").onclick = () => loadPO($("in-po").value);
+    $("btn-sync").onclick = () => syncOpenPOs(true);
     $("btn-save").onclick = () => onQty($("in-qty").value);
     $("btn-undo").onclick = undoLast;
     $("in-sku").addEventListener("input", () => { if (cur.step !== "sku") { cur.line = null; cur.base = null; cur.cands = null; setStep("sku"); } });
@@ -623,19 +804,16 @@
     $("dlg-settings-cancel").onclick = () => $("dlg-settings").close();
     document.querySelectorAll(".tab").forEach((t) => (t.onclick = () => showTab(t.dataset.tab)));
     window.addEventListener("online", setNet); window.addEventListener("offline", setNet);
-    // tap anywhere empty on scan view → refocus the active field (scanner guns need focus)
     $("view-scan").addEventListener("click", (e) => {
       if (e.target.closest("input,button,a")) return;
-      const f = ["in-qty", "in-size", "in-sku", "in-po"].map($).find((x) => !x.disabled);
+      const f = ["in-qty", "in-size", "in-sku", "in-loc", "in-po"].map($).find((x) => !x.disabled);
       f && f.focus();
     });
-    // any batch left mid-send from a crash/reload is unknown → must be verified
-    let stuck = 0;
-    S.batches.forEach((b) => { if (b.state === "sending" || b.state === "queued") { b.state = "unknown"; b.error = "App closed during upload."; stuck++; } });
-    if (stuck) save();
-    setNet(); renderBadge(); setStep("po");
+    setNet(); renderBadge(); renderOpenList(); setStep("po");
     if (S.batches.some((b) => b.state === "unknown" || b.state === "review")) say("warn", "An earlier upload needs checking — open the Saved tab.");
-    ping();
+    else say("", "Scan a PO number to start.");
+    syncOpenPOs(false);
+    setInterval(() => { if (!uploading && navigator.onLine) syncOpenPOs(false); }, RESYNC_MS);
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot); else boot();
 })();

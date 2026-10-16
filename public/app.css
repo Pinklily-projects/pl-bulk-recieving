@@ -62,6 +62,12 @@ label{ display:block; font-size:13px; font-weight:600; color:var(--pl-grey); mar
 .btn.sm{ padding:6px 10px; font-size:13px; }
 .link{ background:none; border:0; color:var(--pl-pink-dark); font-weight:600; padding:4px; }
 
+.link.sync{ font-size:12px; font-weight:600; color:var(--pl-grey-soft); }
+.link.sync.busy{ color:var(--pl-pink-dark); }
+.loc-card{ margin-top:10px; padding:10px 12px; border-radius:10px; background:var(--ok-soft); color:var(--ok); font-weight:600; display:flex; justify-content:space-between; align-items:center; gap:8px; }
+.loc-card .sub{ font-weight:500; font-size:12px; color:var(--pl-grey-soft); }
+.loc-tag{ display:inline-block; font-size:12px; font-weight:700; color:var(--ok); background:var(--ok-soft); padding:2px 8px; border-radius:6px; }
+.steps li{ font-size:13px; }
 .po-card,.line-card{ margin-top:10px; padding:10px 12px; border-radius:10px; background:var(--pl-pink-softer); font-size:14px; line-height:1.45; }
 .po-card b,.line-card b{ font-size:16px; }
 .kv{ display:flex; flex-wrap:wrap; gap:4px 14px; color:var(--pl-grey); }
