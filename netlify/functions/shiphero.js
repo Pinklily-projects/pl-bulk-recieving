@@ -62,7 +62,9 @@ async function gql(query, variables, retried = false) {
     const code = e.code != null ? ` (code ${e.code})` : "";
     const wait = e.time_remaining ? ` Retry in ${e.time_remaining}.` : "";
     const rid = e.request_id ? ` request_id ${e.request_id}` : "";
-    throw new Error(`${e.message || "ShipHero error"}${code}.${wait}${rid}`.trim());
+    const err = new Error(`${e.message || "ShipHero error"}${code}.${wait}${rid}`.trim());
+    err.code = e.code;
+    throw err;
   }
   return body.data;
 }
@@ -71,9 +73,11 @@ const LINE_FIELDS = `
   pageInfo { hasNextPage endCursor }
   edges { node { sku quantity quantity_received quantity_rejected product_name option_title barcode vendor_sku fulfillment_status } }`;
 
-const PO_QUERY = `
-query GetPO($po: String, $id: String, $after: String) {
-  purchase_order(po_number: $po, id: $id) {
+// Build the query with only the argument we have: ShipHero rejects an explicit
+// `id: null` with "Invalid id" (code 3).
+const poQuery = (by) => `
+query GetPO($key: String!, $after: String) {
+  purchase_order(${by}: $key) {
     request_id complexity
     data {
       id po_number fulfillment_status po_date warehouse_id
@@ -89,7 +93,9 @@ async function fetchPO({ po_number, id }) {
   let po = null;
   const lines = [];
   for (let page = 0; page < 40; page++) {
-    const data = await gql(PO_QUERY, { po: id ? null : po_number, id: id || null, after });
+    const data = id
+      ? await gql(poQuery("id"), { key: id, after })
+      : await gql(poQuery("po_number"), { key: po_number, after });
     const d = data && data.purchase_order && data.purchase_order.data;
     if (!d) return null;
     if (!po) po = d;
@@ -154,7 +160,12 @@ exports.handler = async (event) => {
       const po_number = cleanStr(body.po_number);
       const id = cleanStr(body.id);
       if (!po_number && !id) return json(400, { error: "PO number required." });
-      const po = await fetchPO({ po_number, id });
+      let po = null;
+      try {
+        po = await fetchPO({ po_number, id });
+      } catch (e) {
+        if (e.code !== 5) throw e; // 5 = Not Found
+      }
       if (!po) return json(404, { error: `PO ${po_number || id} not found in ShipHero.` });
       return json(200, { po });
     }
