@@ -122,3 +122,12 @@ td .sub{ font-size:12px; color:var(--pl-grey-soft); }
   .scan{ font-size:20px; }
   .nums strong{ font-size:16px; }
 }
+
+/* FAI */
+.fai-hold{ margin-top:10px; padding:10px 12px; border-radius:10px; background:var(--warn-soft); border:2px solid #F2B84B; color:#6B3F00; }
+.fai-hold b{ color:#9A5B00; font-size:15px; }
+.fai-hold ul{ margin:6px 0 8px; padding-left:18px; }
+.fai-hold .sub{ font-size:12px; color:#6B3F00; }
+.fai-list-card summary{ cursor:pointer; color:#9A5B00; }
+.fai-list{ list-style:none; padding:0; margin:8px 0 0; }
+.fai-list li{ display:flex; justify-content:space-between; gap:8px; padding:6px 0; border-top:1px solid var(--pl-line); font-size:14px; }

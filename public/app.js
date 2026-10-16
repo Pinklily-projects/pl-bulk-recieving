@@ -25,7 +25,7 @@
   // ---------------------------------------------------------------- storage
   const blank = () => ({
     pos: {}, scans: [], batches: [], poLoc: {}, locs: {}, open: { keys: [], at: 0 },
-    settings: { pin: "", receiver: "", sound: true },
+    settings: { pin: "", receiver: "", sound: true }, defaultLoc: "Receiving",
   });
   let S = load();
   function load() {
@@ -155,6 +155,10 @@
       for (const l of b.lines) if (norm(l.sku) === s) n += l.qty;
     return n;
   }
+  // FAI: lines whose product has no weight/dimensions in ShipHero and still have units to receive
+  const faiLines = (po) => (po && po.lines ? po.lines.filter((l) => l.fai && l.received < l.ordered) : []);
+  const onHold = (key) => faiLines(S.pos[key]).length > 0;
+
   function applyPO(po) {
     const key = norm(po.po_number);
     S.pos[key] = Object.assign({}, po, { fetchedAt: Date.now() });
@@ -200,10 +204,22 @@
     $("sync-status").textContent = S.open.at
       ? `${n} open PO${n === 1 ? "" : "s"} · ${new Date(S.open.at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`
       : "Open POs: —";
-    $("open-pos").innerHTML = S.open.keys.map((k) => {
+    const keys = S.open.keys.slice().sort((a, b) => faiLines(S.pos[b]).length - faiLines(S.pos[a]).length);
+    $("open-pos").innerHTML = keys.map((k) => {
       const p = S.pos[k]; if (!p) return "";
-      return `<option value="${esc(p.po_number)}">${esc(p.vendor || "")}</option>`;
+      const n = faiLines(p).length;
+      return `<option value="${esc(p.po_number)}">${n ? `FAI (${n}) · ` : ""}${esc(p.vendor || "")}</option>`;
     }).join("");
+    renderFaiList();
+  }
+
+  function renderFaiList() {
+    const list = S.open.keys.map((k) => S.pos[k]).filter((p) => p && faiLines(p).length)
+      .sort((a, b) => faiLines(b).length - faiLines(a).length);
+    $("fai-wrap").hidden = !list.length;
+    $("fai-count").textContent = list.length;
+    $("fai-list").innerHTML = list.map((p) => `<li><button class="link" data-fai-po="${esc(p.po_number)}">PO ${esc(p.po_number)}</button>
+      <span>${faiLines(p).length} SKU${faiLines(p).length > 1 ? "s" : ""} need FAI · ${esc(p.vendor || "")}</span></li>`).join("");
   }
 
   // ---------------------------------------------------------------- scan flow
@@ -273,17 +289,55 @@
     cur.line = null; cur.base = null; cur.cands = null;
     $("line-card").hidden = true; $("in-sku").value = ""; $("in-size").value = ""; $("in-qty").value = ""; $("in-loc").value = "";
     renderRecent();
-    const loc = S.poLoc[cur.po];
-    renderLocCard();
     const pre = closed ? `PO ${po.po_number} is ${po.status} in ShipHero — the upload may be rejected. `
       : how === "offline" ? `Offline — using saved copy of PO ${po.po_number}. ` : `PO ${po.po_number} ready. `;
-    if (loc) {
-      say(closed || how === "offline" ? "warn" : "ok", `${pre}Putting away to ${loc.name}. Scan a SKU.`);
-      setStep("sku");
-    } else {
-      say(closed || how === "offline" ? "warn" : "ok", `${pre}Scan the location this PO is going to.`);
-      setStep("loc");
+    const kind = closed || how === "offline" ? "warn" : "ok";
+    const key = cur.po;
+    if (onHold(key)) {
+      $("loc-card").hidden = true;
+      beep("err");
+      say("err", `FAI HOLD — PO ${po.po_number} has ${faiLines(po).length} SKU(s) that need First Article Inspection in ShipHero first. Do those, then tap Re-check.`);
+      setStep("po");
+      return;
     }
+    if (S.poLoc[key]) { renderLocCard(); say(kind, `${pre}Putting away to ${S.poLoc[key].name}. Scan a SKU.`); setStep("sku"); return; }
+    // No location yet → use the default (Receiving). Scanning a location barcode later changes it.
+    $("loc-card").hidden = true;
+    setStep("sku");
+    cur.locPending = lookupLocation(S.defaultLoc, po);
+    cur.locPending.then((loc) => {
+      if (cur.po !== key) return;
+      S.poLoc[key] = loc; save(); renderLocCard();
+      say(kind, `${pre}Putting away to ${loc.name} (default — scan a location to change). Scan a SKU.`);
+    }).catch((e) => {
+      if (cur.po !== key) return;
+      beep("err");
+      say("err", `${pre}Couldn't set the default location ${S.defaultLoc}: ${e.message} Scan a location.`);
+      setStep("loc");
+    });
+  }
+
+  // Resolve a location name in the PO's warehouse (cached so it works offline)
+  async function lookupLocation(name, po) {
+    const ck = `${po.warehouse_id || ""}|${norm(name)}`;
+    try {
+      const loc = (await api("getLocation", { name, warehouse_id: po.warehouse_id })).location;
+      S.locs[ck] = { id: loc.id, name: loc.name, sellable: loc.sellable, pickable: loc.pickable };
+      return S.locs[ck];
+    } catch (e) {
+      if (e.network && S.locs[ck]) return S.locs[ck];
+      throw e;
+    }
+  }
+  const knownLocation = (po, name) => S.locs[`${po.warehouse_id || ""}|${norm(name)}`] || null;
+
+  function setLocation(loc, how) {
+    S.poLoc[cur.po] = loc; save();
+    renderLocCard();
+    $("in-loc").value = "";
+    beep("ok");
+    say("ok", `${how === "changed" ? "Location changed" : "Putting away"} to ${loc.name}. Scan a SKU.`);
+    setStep("sku");
   }
 
   function renderPOCard() {
@@ -295,13 +349,38 @@
       <div class="kv"><span>${esc(po.vendor || "Vendor —")}</span><span>${esc(po.warehouse || "")}</span>
       <span>Status: ${esc(po.status || "—")}</span><span>${po.lines.length} SKUs</span>
       <span>Received ${received} / ${ordered}</span></div>
-      <button class="link" id="btn-change-po">Change PO</button>`;
+      <button class="link" id="btn-change-po">Change PO</button>
+      ${holdBox(po)}`;
     $("po-card").hidden = false;
+    const rc = $("btn-recheck-fai"); if (rc) rc.onclick = recheckFAI;
     $("btn-change-po").onclick = () => {
       cur.po = null; cur.line = null; cur.base = null; cur.cands = null;
       $("in-po").value = ""; $("po-card").hidden = true; $("loc-card").hidden = true; $("line-card").hidden = true; $("recent-wrap").hidden = true;
       say("", "Scan a PO number to start."); setStep("po");
     };
+  }
+
+  function holdBox(po) {
+    const lines = faiLines(po);
+    if (!lines.length) return "";
+    const shown = lines.slice(0, 12).map((l) => `<li><span class="mono">${esc(l.sku)}</span> <span class="sub">${esc(l.name || "")}</span></li>`).join("");
+    return `<div class="fai-hold"><b>FAI HOLD — do these first</b>
+      <div class="sub">These SKUs have no weight/dimensions in ShipHero, so they need First Article Inspection. Receive them through ShipHero's receiving screen (it prompts for FAI), then come back and tap Re-check to finish this PO here.</div>
+      <ul>${shown}${lines.length > 12 ? `<li class="sub">+${lines.length - 12} more</li>` : ""}</ul>
+      <button class="btn sm primary" id="btn-recheck-fai">Re-check FAI</button></div>`;
+  }
+
+  async function recheckFAI() {
+    const key = cur.po, po = S.pos[key];
+    if (!po) return;
+    say("", `Re-checking PO ${po.po_number}…`);
+    try {
+      const fresh = (await api("getPO", { id: po.id })).po;
+      applyPO(fresh); save(); renderOpenList();
+      if (cur.po !== key) return;
+      if (onHold(key)) { renderPOCard(); beep("err"); say("err", `Still on hold: ${faiLines(S.pos[key]).length} SKU(s) need FAI.`); }
+      else { onPOReady("live"); }
+    } catch (e) { beep("err"); say("err", `Couldn't re-check: ${e.message}`); }
   }
 
   function renderLocCard() {
@@ -319,25 +398,11 @@
     const po = S.pos[cur.po];
     if (!po) { setStep("po"); return; }
     if (lineFor(po, name) || baseCandidates(po, name).length) {
-      beep("err"); say("err", `That looks like a SKU (${name}). Scan the location barcode first.`); $("in-loc").select(); return;
+      beep("err"); say("err", `That looks like a SKU (${name}). Scan a location barcode.`); $("in-loc").select(); return;
     }
-    const ck = `${po.warehouse_id || ""}|${norm(name)}`;
     say("", `Checking location ${name}…`);
-    let loc = null;
-    try {
-      loc = (await api("getLocation", { name, warehouse_id: po.warehouse_id })).location;
-      S.locs[ck] = loc;
-    } catch (e) {
-      if (e.network && S.locs[ck]) loc = S.locs[ck];
-      else { beep("err"); say("err", e.network ? `Offline and location ${name} isn't saved on this device.` : e.message); $("in-loc").select(); return; }
-    }
-    S.poLoc[cur.po] = { id: loc.id, name: loc.name, sellable: loc.sellable, pickable: loc.pickable };
-    save();
-    renderLocCard();
-    $("in-loc").value = loc.name;
-    beep("ok");
-    say("ok", `Putting away to ${loc.name}. Scan a SKU.`);
-    setStep("sku");
+    try { setLocation(await lookupLocation(name, po), "changed"); }
+    catch (e) { beep("err"); say("err", e.network ? `Offline and location ${name} isn't saved on this device.` : e.message); $("in-loc").select(); }
   }
 
   function onSku(raw) {
@@ -345,10 +410,13 @@
     if (!code) return;
     const po = S.pos[cur.po];
     if (!po) { setStep("po"); return; }
-    if (!S.poLoc[cur.po]) { setStep("loc"); return; }
+    if (onHold(cur.po)) { beep("err"); say("err", `PO ${po.po_number} is on FAI hold. Do the FAI SKUs first, then tap Re-check.`); setStep("po"); return; }
     cur.base = null; cur.cands = null; $("in-size").value = "";
     const line = lineFor(po, code);
     if (!line) {
+      // A known location scanned in the SKU field → switch location instantly
+      const known = knownLocation(po, code);
+      if (known) { $("in-sku").value = ""; setLocation(known, "changed"); return; }
       const cands = baseCandidates(po, code);
       if (cands.length) {
         cur.base = code; cur.cands = cands; cur.line = null;
@@ -360,10 +428,22 @@
         setStep("size");
         return;
       }
-      beep("err");
-      say("err", `${code} is not on PO ${po.po_number}. Set it aside and check with a lead.`);
-      $("in-sku").select();
+      // Not a SKU on this PO → maybe it's a location barcode
+      say("", `Checking ${code}…`);
+      lookupLocation(code, po).then((loc) => {
+        $("in-sku").value = ""; setLocation(loc, "changed");
+      }).catch(() => {
+        beep("err");
+        say("err", `${code} is not on PO ${po.po_number} and isn't a location. Set it aside and check with a lead.`);
+        $("in-sku").select();
+      });
       return;
+    }
+    if (!S.poLoc[cur.po]) {
+      // default location still resolving (scanner was faster than the network) → wait for it
+      const key = cur.po;
+      if (cur.locPending) { cur.locPending.then(() => { if (cur.po === key && S.poLoc[key]) pickLine(line); }).catch(() => {}); return; }
+      beep("err"); say("err", "No location set for this PO yet. Scan a location."); setStep("loc"); return;
     }
     pickLine(line);
   }
@@ -422,6 +502,7 @@
     const po = S.pos[cur.po], l = cur.line, loc = S.poLoc[cur.po];
     if (!po || !l) { setStep("sku"); return; }
     if (!loc) { setStep("loc"); return; }
+    if (onHold(cur.po)) { beep("err"); say("err", `PO ${po.po_number} is on FAI hold.`); setStep("po"); return; }
     if (!v) return;
     if (lineFor(po, v)) { beep("err"); say("err", `That's a SKU (${v}), not a quantity. Scan or type the quantity.`); $("in-qty").select(); return; }
     if (!/^\d+$/.test(v)) { beep("err"); say("err", `"${v}" isn't a quantity. Use whole numbers only.`); $("in-qty").select(); return; }
@@ -626,6 +707,22 @@
     say(bad ? "warn" : "ok", `Upload finished: ${parts.join(", ") || "nothing to do"}.`);
   }
 
+  // Receiving log written to the PO line's note so it's visible on the PO page in ShipHero.
+  // Keeps whatever note was there; trims the oldest app entries if it gets long.
+  function lineNote(po, l, b) {
+    const pl = lineFor(po, l.sku);
+    const prev = String((pl && pl.note) || "").trim();
+    const d = new Date();
+    const stamp = `${d.getMonth() + 1}/${d.getDate()} ${d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`;
+    const entry = `PLR ${stamp} ${b.by || "-"} +${l.qty} → ${b.location.name}`;
+    let lines = prev ? prev.split("\n") : [];
+    lines.push(entry);
+    while (lines.join("\n").length > 900 && lines.findIndex((x) => x.startsWith("PLR ")) !== -1 && lines.length > 1) {
+      lines.splice(lines.findIndex((x) => x.startsWith("PLR ")), 1);
+    }
+    return lines.join("\n");
+  }
+
   const lineTag = (b, i) => `[PLR-${b.tag}.${i}]`;
   const lineReason = (b, i) => `PL Receiving · PO ${b.po_number} · ${b.location.name} · ${b.by || "-"} ${lineTag(b, i)}`.slice(0, 200);
 
@@ -640,6 +737,9 @@
       b.po_id = po.id; b.warehouse_id = po.warehouse_id;
     } catch (e) {
       return stopBatch(b, `Couldn't read the PO from ShipHero: ${e.message}`, !anyApplied(b) && !e.network);
+    }
+    if (!anyApplied(b) && faiLines(po).length) {
+      return releaseBatch(b, `FAI hold: ${faiLines(po).length} SKU(s) on PO ${po.po_number} need First Article Inspection in ShipHero first (${faiLines(po).slice(0, 5).map((l) => l.sku).join(", ")}${faiLines(po).length > 5 ? "…" : ""}). Scans kept.`);
     }
     if (!b.before) {
       const missing = b.lines.filter((l) => !lineFor(po, l.sku));
@@ -689,7 +789,7 @@
     if (b.poStep !== "done") {
       b.poStep = "sending"; save();
       try {
-        const r = await api("receive", { po_id: b.po_id, line_items: b.lines.map((l) => ({ sku: l.sku, quantity_received: l.qty })) });
+        const r = await api("receive", { po_id: b.po_id, line_items: b.lines.map((l) => ({ sku: l.sku, quantity_received: l.qty, note: lineNote(po, l, b) })) });
         b.poStep = "done"; b.request_id = r.request_id;
       } catch (e) {
         const definite = e.status === 400 || e.status === 401 || e.status === 404 || e.status === 429;
@@ -790,6 +890,7 @@
     });
     $("btn-po").onclick = () => loadPO($("in-po").value);
     $("btn-sync").onclick = () => syncOpenPOs(true);
+    $("fai-list").addEventListener("click", (e) => { const b = e.target.closest("[data-fai-po]"); if (b) { showTab("scan"); loadPO(b.dataset.faiPo); } });
     $("btn-save").onclick = () => onQty($("in-qty").value);
     $("btn-undo").onclick = undoLast;
     $("in-sku").addEventListener("input", () => { if (cur.step !== "sku") { cur.line = null; cur.base = null; cur.cands = null; setStep("sku"); } });
@@ -812,6 +913,7 @@
     setNet(); renderBadge(); renderOpenList(); setStep("po");
     if (S.batches.some((b) => b.state === "unknown" || b.state === "review")) say("warn", "An earlier upload needs checking — open the Saved tab.");
     else say("", "Scan a PO number to start.");
+    api("ping").then((r) => { if (r && r.default_location && r.default_location !== S.defaultLoc) { S.defaultLoc = r.default_location; save(); } }).catch(() => {});
     syncOpenPOs(false);
     setInterval(() => { if (!uploading && navigator.onLine) syncOpenPOs(false); }, RESYNC_MS);
   }

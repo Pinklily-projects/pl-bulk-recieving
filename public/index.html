@@ -42,6 +42,11 @@
 
     <div id="msg" class="msg" role="status" aria-live="assertive">Scan a PO number to start.</div>
 
+    <details class="card fai-list-card" id="fai-wrap" hidden>
+      <summary><b>FAI first</b> — <span id="fai-count">0</span> open POs need First Article Inspection</summary>
+      <ul id="fai-list" class="fai-list"></ul>
+    </details>
+
     <div class="card">
       <div class="card-head"><label for="in-po">PO number</label><button id="btn-sync" class="link sync" title="Reload open POs from ShipHero"><span id="sync-status">Open POs: —</span> ↻</button></div>
       <div class="row">
@@ -53,7 +58,7 @@
     </div>
 
     <div class="card">
-      <label for="in-loc">Location <span class="hint">(where this PO is going — scan once)</span></label>
+      <label for="in-loc">Location <span class="hint">(defaults to Receiving — scan a location barcode any time to change)</span></label>
       <input id="in-loc" class="scan" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="Scan location barcode" disabled>
       <div id="loc-card" class="loc-card" hidden></div>
     </div>
