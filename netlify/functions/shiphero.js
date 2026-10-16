@@ -13,6 +13,7 @@
 // Env vars (Netlify → Site settings → Environment variables):
 //   SHIPHERO_REFRESH_TOKEN  required
 //   APP_PIN                 strongly recommended; receivers enter it once per device
+//   DEFAULT_LOCATION        optional; location every PO starts on (default "Receiving")
 //   OPEN_PO_DAYS            optional; how far back the startup pull of open POs looks (default 180)
 //   SHIPHERO_API_URL        optional override (used for testing)
 //   SHIPHERO_REFRESH_URL    optional override (used for testing)
@@ -76,7 +77,7 @@ async function gql(query, variables, retried = false) {
 
 const LINE_FIELDS = `
   pageInfo { hasNextPage endCursor }
-  edges { node { sku quantity quantity_received quantity_rejected product_name option_title barcode vendor_sku fulfillment_status } }`;
+  edges { node { sku quantity quantity_received quantity_rejected product_name option_title barcode vendor_sku fulfillment_status note product { product { dimensions { weight height width length } } } } }`;
 
 // Build the query with only the argument we have: ShipHero rejects an explicit
 // `id: null` with "Invalid id" (code 3).
@@ -92,6 +93,12 @@ query GetPO($key: String!, $after: String) {
     }
   }
 }`;
+
+function needsFAI(l) {
+  const d = l.product && l.product.product && l.product.product.dimensions;
+  if (!d) return false; // product not resolvable → don't block
+  return ["weight", "length", "width", "height"].some((k) => !(parseFloat(d[k]) > 0));
+}
 
 function mapPO(po, lines) {
   return {
@@ -111,6 +118,9 @@ function mapPO(po, lines) {
       rejected: l.quantity_rejected || 0,
       barcode: l.barcode || "",
       vendor_sku: l.vendor_sku || "",
+      note: l.note || "",
+      // ShipHero flags First Article Inspection (FAI) when the product has no weight/dimensions yet
+      fai: needsFAI(l),
     })),
   };
 }
@@ -209,7 +219,7 @@ exports.handler = async (event) => {
 
   try {
     if (body.action === "ping") {
-      return json(200, { ok: true });
+      return json(200, { ok: true, default_location: process.env.DEFAULT_LOCATION || "Receiving" });
     }
 
     if (body.action === "getPO") {
@@ -295,7 +305,10 @@ exports.handler = async (event) => {
         if (!sku || !Number.isInteger(q) || q < 1 || q > MAX_QTY_PER_LINE) {
           return json(400, { error: `Invalid line: ${JSON.stringify(l).slice(0, 100)}` });
         }
-        line_items.push({ sku, quantity_received: q });
+        const li = { sku, quantity_received: q };
+        // optional receiving log line appended (client-side) to the PO line's note
+        if (typeof l.note === "string") li.note = l.note.slice(0, 2000);
+        line_items.push(li);
       }
       // quantity_received is ADDITIVE in ShipHero — each call adds to the existing total.
       const data = await gql(RECEIVE_MUTATION, { data: { po_id, line_items } });
