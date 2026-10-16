@@ -2,13 +2,18 @@
 //
 // The browser never sees a ShipHero token. This function holds the refresh
 // token (env SHIPHERO_REFRESH_TOKEN), mints short-lived access tokens, and
-// exposes ONLY two actions:
-//   getPO    — read a purchase order + its line items by PO number
-//   receive  — add quantity_received to PO lines (purchase_order_update)
+// exposes ONLY these actions:
+//   openPOs         — page through open (pending) POs with their lines, for preloading
+//   getPO           — read a purchase order + its line items
+//   getLocation     — resolve a scanned location name to a ShipHero location
+//   addInventory    — inventory_add one SKU into a location (reason must be a PL Receiving tag)
+//   findChange      — look up a tagged inventory change (makes retries safe)
+//   receive         — add quantity_received to PO lines (purchase_order_update)
 //
 // Env vars (Netlify → Site settings → Environment variables):
 //   SHIPHERO_REFRESH_TOKEN  required
 //   APP_PIN                 strongly recommended; receivers enter it once per device
+//   OPEN_PO_DAYS            optional; how far back the startup pull of open POs looks (default 180)
 //   SHIPHERO_API_URL        optional override (used for testing)
 //   SHIPHERO_REFRESH_URL    optional override (used for testing)
 
@@ -88,6 +93,28 @@ query GetPO($key: String!, $after: String) {
   }
 }`;
 
+function mapPO(po, lines) {
+  return {
+    id: po.id,
+    po_number: po.po_number,
+    status: po.fulfillment_status,
+    po_date: po.po_date,
+    vendor: po.vendor && po.vendor.name,
+    warehouse: po.warehouse && po.warehouse.identifier,
+    warehouse_id: po.warehouse_id,
+    lines: lines.map((l) => ({
+      sku: l.sku,
+      name: [l.product_name, l.option_title].filter(Boolean).join(" — "),
+      option_title: l.option_title || "",
+      ordered: l.quantity || 0,
+      received: l.quantity_received || 0,
+      rejected: l.quantity_rejected || 0,
+      barcode: l.barcode || "",
+      vendor_sku: l.vendor_sku || "",
+    })),
+  };
+}
+
 async function fetchPO({ po_number, id }) {
   let after = null;
   let po = null;
@@ -104,25 +131,54 @@ async function fetchPO({ po_number, id }) {
     after = d.line_items.pageInfo.endCursor;
     id = d.id;
   }
-  return {
-    id: po.id,
-    po_number: po.po_number,
-    status: po.fulfillment_status,
-    po_date: po.po_date,
-    vendor: po.vendor && po.vendor.name,
-    warehouse: po.warehouse && po.warehouse.identifier,
-    lines: lines.map((l) => ({
-      sku: l.sku,
-      name: [l.product_name, l.option_title].filter(Boolean).join(" — "),
-      option_title: l.option_title || "",
-      ordered: l.quantity || 0,
-      received: l.quantity_received || 0,
-      rejected: l.quantity_rejected || 0,
-      barcode: l.barcode || "",
-      vendor_sku: l.vendor_sku || "",
-    })),
-  };
+  return mapPO(po, lines);
 }
+
+
+
+const OPEN_POS_QUERY = `
+query OpenPOs($from: ISODateTime, $after: String) {
+  purchase_orders(fulfillment_status: "pending", created_from: $from) {
+    request_id complexity
+    data(first: 15, after: $after) {
+      pageInfo { hasNextPage endCursor }
+      edges { node {
+        id po_number fulfillment_status po_date warehouse_id created_at
+        vendor { name }
+        warehouse { identifier }
+        line_items(first: 100) { ${LINE_FIELDS} }
+      } }
+    }
+  }
+}`;
+
+const LOCATION_QUERY = `
+query Loc($name: String!, $wh: String) {
+  locations(name: $name, warehouse_id: $wh) {
+    request_id complexity
+    data(first: 10) { edges { node { id name warehouse_id zone pickable sellable } } }
+  }
+}`;
+
+const INVENTORY_ADD = `
+mutation Add($data: UpdateInventoryInput!) {
+  inventory_add(data: $data) {
+    request_id complexity
+    warehouse_product { sku on_hand }
+  }
+}`;
+
+const CHANGES_QUERY = `
+query Changes($sku: String!, $wh: String, $reason: String!, $from: ISODateTime!, $to: ISODateTime!) {
+  inventory_changes(sku: $sku, warehouse_id: $wh, reason: $reason, date_from: $from, date_to: $to) {
+    request_id complexity
+    data(first: 20) { edges { node { sku change_in_on_hand reason location_id created_at } } }
+  }
+}`;
+
+// Every inventory_add reason must look like "PL Receiving · … [PLR-xxxx.n] …"
+const REASON_RE = /^PL Receiving · .{1,150}\[PLR-[a-z0-9]{6,24}\.\d{1,4}\]/;
+const TAG_RE = /^\[PLR-[a-z0-9]{6,24}\.\d{1,4}\]$/;
 
 const RECEIVE_MUTATION = `
 mutation Receive($data: UpdatePurchaseOrderInput!) {
@@ -170,6 +226,62 @@ exports.handler = async (event) => {
       return json(200, { po });
     }
 
+
+
+    if (body.action === "openPOs") {
+      const days = Math.min(Math.max(parseInt(process.env.OPEN_PO_DAYS || "180", 10) || 180, 7), 730);
+      const from = new Date(Date.now() - days * 864e5).toISOString().slice(0, 19);
+      const after = cleanStr(body.after, 200) || null;
+      const data = await gql(OPEN_POS_QUERY, { from, after });
+      const conn = data && data.purchase_orders && data.purchase_orders.data;
+      if (!conn) return json(200, { pos: [], next: null });
+      const pos = conn.edges.map((e) => e.node).filter((n) => n.po_number).map((n) => {
+        const po = mapPO(n, n.line_items.edges.map((x) => x.node));
+        po.complete = !n.line_items.pageInfo.hasNextPage; // false → more than 100 lines, fetch fully on scan
+        return po;
+      });
+      return json(200, { pos, next: conn.pageInfo.hasNextPage ? conn.pageInfo.endCursor : null, days });
+    }
+
+    if (body.action === "getLocation") {
+      const name = cleanStr(body.name, 80);
+      const wh = cleanStr(body.warehouse_id, 80) || null;
+      if (!name) return json(400, { error: "Location required." });
+      const data = await gql(LOCATION_QUERY, { name, wh });
+      const edges = (data && data.locations && data.locations.data && data.locations.data.edges) || [];
+      const hit = edges.map((e) => e.node).find((n) => n.name.toUpperCase() === name.toUpperCase() && (!wh || n.warehouse_id === wh));
+      if (!hit) return json(404, { error: `Location ${name} not found${wh ? " in this PO's warehouse" : ""}.` });
+      return json(200, { location: hit });
+    }
+
+    if (body.action === "addInventory") {
+      const sku = cleanStr(body.sku);
+      const warehouse_id = cleanStr(body.warehouse_id, 80);
+      const location_id = cleanStr(body.location_id, 80);
+      const reason = cleanStr(body.reason, 200);
+      const quantity = Number(body.quantity);
+      if (!sku || !warehouse_id || !location_id) return json(400, { error: "sku, warehouse_id and location_id are required." });
+      if (!Number.isInteger(quantity) || quantity < 1 || quantity > MAX_QTY_PER_LINE) return json(400, { error: "Invalid quantity." });
+      if (!REASON_RE.test(reason)) return json(400, { error: "Invalid reason tag." });
+      const data = await gql(INVENTORY_ADD, { data: { sku, warehouse_id, location_id, quantity, reason } });
+      const out = data && data.inventory_add;
+      if (!out) throw new Error("ShipHero returned no result for inventory_add.");
+      return json(200, { ok: true, request_id: out.request_id, on_hand: out.warehouse_product && out.warehouse_product.on_hand });
+    }
+
+    if (body.action === "findChange") {
+      const sku = cleanStr(body.sku);
+      const tag = cleanStr(body.tag, 40);
+      const wh = cleanStr(body.warehouse_id, 80) || null;
+      const since = new Date(Number(body.since) || 0);
+      if (!sku || !TAG_RE.test(tag) || isNaN(since)) return json(400, { error: "sku, tag and since required." });
+      const from = new Date(Math.max(since.getTime() - 10 * 60e3, Date.now() - 59 * 864e5));
+      const data = await gql(CHANGES_QUERY, { sku, wh, reason: tag, from: from.toISOString().slice(0, 19), to: new Date(Date.now() + 10 * 60e3).toISOString().slice(0, 19) });
+      const edges = (data && data.inventory_changes && data.inventory_changes.data && data.inventory_changes.data.edges) || [];
+      const hits = edges.map((e) => e.node).filter((n) => (n.reason || "").includes(tag));
+      return json(200, { found: hits.length, change: hits.reduce((a, n) => a + (n.change_in_on_hand || 0), 0) });
+    }
+
     if (body.action === "receive") {
       const po_id = cleanStr(body.po_id);
       if (!po_id) return json(400, { error: "po_id required." });
@@ -194,6 +306,11 @@ exports.handler = async (event) => {
 
     return json(400, { error: "Unknown action." });
   } catch (err) {
+    if (err.code === 30) {
+      const m = /(\d+)\s*(second|minute)/i.exec(err.message || "");
+      const secs = m ? parseInt(m[1], 10) * (/minute/i.test(m[2]) ? 60 : 1) : 5;
+      return json(429, { error: "ShipHero is busy (credit limit). Retrying shortly.", retry_after: secs });
+    }
     return json(502, { error: err.message || String(err) });
   }
 };
